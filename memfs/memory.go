@@ -313,7 +313,12 @@ func (fi *fileInfo) Size() int64 {
 }
 
 func (fi *fileInfo) Mode() os.FileMode {
-	return os.FileMode(0)
+	mode := os.ModePerm
+	if fi.isDir {
+		mode |= os.ModeDir
+	}
+
+	return mode
 }
 
 func (*fileInfo) ModTime() time.Time {

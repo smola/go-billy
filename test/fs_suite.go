@@ -324,6 +324,7 @@ func (s *FilesystemSuite) TestDirStat(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(fi.Name(), Equals, "qux")
 	c.Assert(fi.IsDir(), Equals, true)
+	c.Assert(fi.Mode().IsDir(), Equals, true)
 	c.Assert(fi.Size(), Equals, int64(4096))
 
 	qux := s.Fs.Dir("qux")
@@ -332,11 +333,13 @@ func (s *FilesystemSuite) TestDirStat(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(fi.Name(), Equals, "baz")
 	c.Assert(fi.IsDir(), Equals, false)
+	c.Assert(fi.Mode().IsDir(), Equals, false)
 
 	fi, err = qux.Stat("/baz")
 	c.Assert(err, IsNil)
 	c.Assert(fi.Name(), Equals, "baz")
 	c.Assert(fi.IsDir(), Equals, false)
+	c.Assert(fi.Mode().IsDir(), Equals, false)
 }
 
 func (s *FilesystemSuite) TestCreateInDir(c *C) {
