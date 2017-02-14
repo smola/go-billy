@@ -2,6 +2,7 @@ package billy
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 )
@@ -141,4 +142,70 @@ func removeAll(fs Filesystem, path string) error {
 
 	return err
 
+}
+
+// CopyFile copies a file from one filesystem, to another file in a
+// (potentially different) file system. Copy will
+func CopyFile(fromFs, toFs Filesystem, from, to string) (err error) {
+	srcInfo, err := fromFs.Stat(from)
+	if err != nil {
+		return err
+	}
+
+	if !srcInfo.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file: %s", from)
+	}
+
+	src, err := fromFs.Open(from)
+	if err != nil {
+		return err
+	}
+	defer checkClose(src, &err)
+
+	dst, err := toFs.OpenFile(to, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, srcInfo.Mode())
+	if err != nil {
+		return err
+	}
+	defer checkClose(dst, &err)
+
+	_, err = io.Copy(dst, src)
+	return err
+}
+
+// CopyRecursive copies a file or directory recursively. It returns as soon as
+// it finds an error.
+func CopyRecursive(fromFs, toFs Filesystem, from, to string) (err error) {
+	srcInfo, err := fromFs.Stat(from)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.Mode().IsRegular() {
+		return CopyFile(fromFs, toFs, from, to)
+	}
+
+	if !srcInfo.IsDir() {
+		return fmt.Errorf("not a regular file or dir: %s", from)
+	}
+
+	fis, err := fromFs.ReadDir(from)
+	if err != nil {
+		return err
+	}
+
+	for _, fi := range fis {
+		fromPath := fromFs.Join(from, fi.Name())
+		toPath := toFs.Join(to, fi.Name())
+		if err := CopyRecursive(fromFs, toFs, fromPath, toPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func checkClose(c io.Closer, err *error) {
+	if cerr := c.Close(); cerr != nil && *err == nil {
+		*err = cerr
+	}
 }
