@@ -76,6 +76,21 @@ func (s *FilesystemSuite) TestCreateClose(c *C) {
 	c.Assert(f.Close(), IsNil)
 }
 
+func (s *FilesystemSuite) TestOpenDirectoryFails(c *C) {
+	f, err := s.Fs.Create("dir/file")
+	c.Assert(err, IsNil)
+	c.Assert(f.Close(), IsNil)
+
+	_, err = s.Fs.Open("dir")
+	c.Assert(err, NotNil)
+
+	_, err = s.Fs.OpenFile("dir", os.O_RDONLY, os.FileMode(0))
+	c.Assert(err, NotNil)
+
+	_, err = s.Fs.Create("dir")
+	c.Assert(err, NotNil)
+}
+
 func (s *FilesystemSuite) TestOpenFileNoTruncate(c *C) {
 	defaultMode := os.FileMode(0666)
 
