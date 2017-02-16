@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"srcd.works/go-billy.v1"
@@ -25,6 +24,7 @@ type Memory struct {
 //New returns a new Memory filesystem
 func New() *Memory {
 	return &Memory{
+		base: "/",
 		s: newStorage(),
 	}
 }
@@ -39,7 +39,7 @@ func (fs *Memory) Open(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDONLY, 0)
 }
 
-func (fs *Memory) open(path string, flag int) (*storage, *file, error) {
+func (fs *Memory) open(path string, flag int) (*storage, *entry, error) {
 	fullpath := fs.Join(fs.base, path)
 	parts := filepath.SplitList(fullpath)
 	if len(parts) == 0 {
@@ -50,34 +50,33 @@ func (fs *Memory) open(path string, flag int) (*storage, *file, error) {
 	for {
 		if len(parts) == 1 {
 			path := parts[0]
-			if dir, ok := currentDir.dirs[path]; ok {
-				return dir, nil, nil
-			}
-
-			if !isCreate(flag) {
-				f, ok := currentDir.files[path]
-				if !ok {
-					return nil, os.ErrNotExist
+			e, ok := currentDir.entries[path]
+			if !ok {
+				if !isCreate(flag) {
+					return nil, nil, os.ErrNotExist
 				}
 
-				return currentDir, f, nil
+				f := newFile(fs.base, fullpath, flag)
+				e = &entry{file: f}
+				currentDir.entries[path] = e
+				return currentDir, e, nil
 			}
 
-			return newFile(fs.base, fullpath, flag), nil
+			return currentDir, e, nil
 		}
 
 		dirPath := parts[0]
-		dir, ok := currentDir.dirs[dirPath]
+		e, ok := currentDir.entries[dirPath]
 		if !ok {
 			if !isCreate(flag) {
 				return nil, nil, os.ErrNotExist
 			}
 
-			dir = newStorage()
-			currentDir.dirs[dirPath] = dir
+			e = &entry{dir: newStorage()}
+			currentDir.entries[dirPath] = e
 		}
 
-		currentDir = dir
+		currentDir = e.dir
 		parts = parts[1:]
 	}
 }
@@ -85,17 +84,17 @@ func (fs *Memory) open(path string, flag int) (*storage, *file, error) {
 // OpenFile returns the file from a given name with given flag and permits.
 func (fs *Memory) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	fullpath := fs.Join(fs.base, filename)
-	_, f, err := fs.open(filename, flag)
+	_, e, err := fs.open(filename, flag)
 	if err != nil {
 		return nil, err
 	}
 
-	if f == nil {
+	if e.IsDir() {
 		return nil, fmt.Errorf("cannot open a directory: %s", filename)
 	}
 
 	n := newFile(fs.base, fullpath, flag)
-	n.content = f.content
+	n.content = e.file.content
 
 	if isAppend(flag) {
 		n.position = int64(n.content.Len())
@@ -110,32 +109,36 @@ func (fs *Memory) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 
 // Stat returns a billy.FileInfo with the information of the requested file.
 func (fs *Memory) Stat(filename string) (billy.FileInfo, error) {
-	d, f, err := fs.open(filename, 0)
+	_, e, err := fs.open(filename, 0)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	if f == nil {
-		return newDirInfo(filename, d.Size())
+	if e.IsDir() {
+		return newDirInfo(filename, e.dir.Size()), nil
 	}
 
-	return newFileInfo(filename, f.content.Len()), nil
+	return newFileInfo(filename, e.file.content.Len()), nil
 }
 
 // ReadDir returns a list of billy.FileInfo in the given directory.
 func (fs *Memory) ReadDir(base string) ([]billy.FileInfo, error) {
-	dir, f, err := fs.open(base, 0)
-	if f != nil {
+	_, e, err := fs.open(base, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	if !e.IsDir() {
 		return nil, fmt.Errorf("not a directory: %s", base)
 	}
 
 	var entries []billy.FileInfo
-	for path, d := range dir.dirs {
-		entries = append(entries, newDirInfo(path, len(d.Size())))
-	}
-
-	for path, f := range dir.files {
-		entries = append(entries, newFileInfo(path, f.content.Len()))
+	for path, d := range e.dir.entries {
+		if d.IsDir() {
+			entries = append(entries, newDirInfo(path, d.dir.Size()))
+		} else {
+			entries = append(entries, newFileInfo(path, d.file.content.Len()))
+		}
 	}
 
 	return entries, nil
@@ -168,33 +171,58 @@ func (fs *Memory) getTempFilename(dir, prefix string) string {
 
 // Rename moves a the `from` file to the `to` file.
 func (fs *Memory) Rename(from, to string) error {
-	fromDir, fromFile, err := fs.open(from, 0)
+	fromDir, fromEntry, err := fs.open(from, 0)
 	if err != nil {
 		return err
 	}
 
-	from = fs.Join(fs.base, from)
-	to = fs.Join(fs.base, to)
-
-	if _, ok := fs.s.files[from]; !ok {
-		return os.ErrNotExist
+	toDir, toEntry, err := fs.open(from, 0)
+	if err != nil && err != os.ErrNotExist {
+		return err
 	}
 
-	fs.s.files[to] = fs.s.files[from]
-	fs.s.files[to].BaseFilename = to
-	delete(fs.s.files, from)
+	fromBasename := filepath.Base(from)
+	toBasename := filepath.Base(to)
+	if fromEntry.IsDir() {
+		if !toEntry.IsDir() {
+			return fmt.Errorf("rename %s %s: not a directory", from, to)
+		}
 
+		if toEntry.dir.Size() > 0 {
+			return fmt.Errorf("rename %s %s: directory not empty", from, to)
+		}
+
+		toDir.entries[to] = fromEntry
+		delete(fromDir.entries, fromBasename)
+		if !fromEntry.IsDir() {
+			fromEntry.file.BaseFilename = filepath.Clean(to)
+		}
+
+		return nil
+	}
+
+	if toEntry.IsDir() {
+		return fmt.Errorf("rename %s %s: is a directory", from, to)
+	}
+
+	toDir.entries[toBasename] = fromEntry
+	delete(fromDir.entries, fromBasename)
 	return nil
 }
 
 // Remove deletes a given file from storage.
 func (fs *Memory) Remove(filename string) error {
-	fullpath := fs.Join(fs.base, filename)
-	if _, ok := fs.s.files[fullpath]; !ok {
-		return os.ErrNotExist
+	d, e, err := fs.open(filename, 0)
+	if err != nil {
+		return err
 	}
 
-	delete(fs.s.files, fullpath)
+	basename := filepath.Base(filename)
+	if e.IsDir() && e.dir.Size() > 0 {
+		return fmt.Errorf("remove %s: directory not empty", filename)
+	}
+
+	delete(d.entries, basename)
 	return nil
 }
 
@@ -351,19 +379,26 @@ func (*fileInfo) Sys() interface{} {
 }
 
 type storage struct {
-	dirs  map[string]*storage
-	files map[string]*file
+	entries map[string]*entry
 }
 
 func newStorage() *storage {
 	return &storage{
-		dirs:  make(map[string]*storage),
-		files: make(map[string]*file),
+		entries: make(map[string]*entry),
 	}
 }
 
-func (s *storage) Size() int64 {
-	return int64(len(s.dirs) + len(s.files))
+func (s *storage) Size() int {
+	return len(s.entries)
+}
+
+type entry struct {
+	dir  *storage
+	file *file
+}
+
+func (e *entry) IsDir() bool {
+	return e.dir != nil
 }
 
 type content struct {
