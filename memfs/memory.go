@@ -7,12 +7,16 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"srcd.works/go-billy.v1"
 )
 
-const separator = '/'
+const (
+	separator = '/'
+	base      = "/"
+)
 
 // Memory a very convenient filesystem based on memory files
 type Memory struct {
@@ -24,8 +28,8 @@ type Memory struct {
 //New returns a new Memory filesystem
 func New() *Memory {
 	return &Memory{
-		base: "/",
-		s: newStorage(),
+		base: base,
+		s:    newStorage(),
 	}
 }
 
@@ -41,15 +45,16 @@ func (fs *Memory) Open(filename string) (billy.File, error) {
 
 func (fs *Memory) open(path string, flag int) (*storage, *entry, error) {
 	fullpath := fs.Join(fs.base, path)
-	parts := filepath.SplitList(fullpath)
-	if len(parts) == 0 {
-		return fs.s, nil, nil
-	}
-
+	parts := strings.Split(fullpath[1:], "/")
 	currentDir := fs.s
 	for {
 		if len(parts) == 1 {
 			path := parts[0]
+
+			if path == "" {
+				return nil, &entry{dir: fs.s}, nil
+			}
+
 			e, ok := currentDir.entries[path]
 			if !ok {
 				if !isCreate(flag) {
@@ -109,6 +114,11 @@ func (fs *Memory) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 
 // Stat returns a billy.FileInfo with the information of the requested file.
 func (fs *Memory) Stat(filename string) (billy.FileInfo, error) {
+	filename = fs.Join(fs.base, filename)
+	filename, err := filepath.Rel(fs.base, filename)
+	if err != nil {
+		return nil, err
+	}
 	_, e, err := fs.open(filename, 0)
 	if err != nil {
 		return nil, err
@@ -155,8 +165,8 @@ func (fs *Memory) TempFile(dir, prefix string) (billy.File, error) {
 		}
 
 		fullpath = fs.getTempFilename(dir, prefix)
-		if _, err := fs.Stat(fullpath); !os.IsNotExist(err) {
-			continue
+		if _, err := fs.Stat(fullpath); os.IsNotExist(err) {
+			break
 		}
 	}
 
