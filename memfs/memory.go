@@ -25,8 +25,7 @@ type Memory struct {
 //New returns a new Memory filesystem
 func New() *Memory {
 	return &Memory{
-		base: "/",
-		s:    &storage{make(map[string]*file, 0)},
+		s: newStorage(),
 	}
 }
 
@@ -40,18 +39,59 @@ func (fs *Memory) Open(filename string) (billy.File, error) {
 	return fs.OpenFile(filename, os.O_RDONLY, 0)
 }
 
+func (fs *Memory) open(path string, flag int) (*storage, *file, error) {
+	fullpath := fs.Join(fs.base, path)
+	parts := filepath.SplitList(fullpath)
+	if len(parts) == 0 {
+		return fs.s, nil, nil
+	}
+
+	currentDir := fs.s
+	for {
+		if len(parts) == 1 {
+			path := parts[0]
+			if dir, ok := currentDir.dirs[path]; ok {
+				return dir, nil, nil
+			}
+
+			if !isCreate(flag) {
+				f, ok := currentDir.files[path]
+				if !ok {
+					return nil, os.ErrNotExist
+				}
+
+				return currentDir, f, nil
+			}
+
+			return newFile(fs.base, fullpath, flag), nil
+		}
+
+		dirPath := parts[0]
+		dir, ok := currentDir.dirs[dirPath]
+		if !ok {
+			if !isCreate(flag) {
+				return nil, nil, os.ErrNotExist
+			}
+
+			dir = newStorage()
+			currentDir.dirs[dirPath] = dir
+		}
+
+		currentDir = dir
+		parts = parts[1:]
+	}
+}
+
 // OpenFile returns the file from a given name with given flag and permits.
 func (fs *Memory) OpenFile(filename string, flag int, perm os.FileMode) (billy.File, error) {
 	fullpath := fs.Join(fs.base, filename)
-	f, ok := fs.s.files[fullpath]
-
-	if !ok && !isCreate(flag) {
-		return nil, os.ErrNotExist
+	_, f, err := fs.open(filename, flag)
+	if err != nil {
+		return nil, err
 	}
 
 	if f == nil {
-		fs.s.files[fullpath] = newFile(fs.base, fullpath, flag)
-		return fs.s.files[fullpath], nil
+		return nil, fmt.Errorf("cannot open a directory: %s", filename)
 	}
 
 	n := newFile(fs.base, fullpath, flag)
@@ -70,47 +110,35 @@ func (fs *Memory) OpenFile(filename string, flag int, perm os.FileMode) (billy.F
 
 // Stat returns a billy.FileInfo with the information of the requested file.
 func (fs *Memory) Stat(filename string) (billy.FileInfo, error) {
-	fullpath := fs.Join(fs.base, filename)
-
-	if _, ok := fs.s.files[fullpath]; ok {
-		return newFileInfo(fs.base, fullpath, fs.s.files[fullpath].content.Len()), nil
+	d, f, err := fs.open(filename, 0)
+	if err != nil {
+		return err
 	}
 
-	info, err := fs.ReadDir(fullpath)
-	if err == nil && len(info) != 0 {
-		return newFileInfo(fs.base, fullpath, len(info)+100), nil
+	if f == nil {
+		return newDirInfo(filename, d.Size())
 	}
 
-	return nil, os.ErrNotExist
+	return newFileInfo(filename, f.content.Len()), nil
 }
 
 // ReadDir returns a list of billy.FileInfo in the given directory.
-func (fs *Memory) ReadDir(base string) (entries []billy.FileInfo, err error) {
-	base = fs.Join(fs.base, base)
-
-	appendedDirs := make(map[string]bool, 0)
-	for fullpath, f := range fs.s.files {
-		if !strings.HasPrefix(fullpath, base) {
-			continue
-		}
-
-		fullpath, _ = filepath.Rel(base, fullpath)
-		parts := strings.Split(fullpath, string(separator))
-
-		if len(parts) == 1 {
-			entries = append(entries, &fileInfo{name: parts[0], size: f.content.Len()})
-			continue
-		}
-
-		if _, ok := appendedDirs[parts[0]]; ok {
-			continue
-		}
-
-		entries = append(entries, &fileInfo{name: parts[0], isDir: true})
-		appendedDirs[parts[0]] = true
+func (fs *Memory) ReadDir(base string) ([]billy.FileInfo, error) {
+	dir, f, err := fs.open(base, 0)
+	if f != nil {
+		return nil, fmt.Errorf("not a directory: %s", base)
 	}
 
-	return
+	var entries []billy.FileInfo
+	for path, d := range dir.dirs {
+		entries = append(entries, newDirInfo(path, len(d.Size())))
+	}
+
+	for path, f := range dir.files {
+		entries = append(entries, newFileInfo(path, f.content.Len()))
+	}
+
+	return entries, nil
 }
 
 var maxTempFiles = 1024 * 4
@@ -124,8 +152,8 @@ func (fs *Memory) TempFile(dir, prefix string) (billy.File, error) {
 		}
 
 		fullpath = fs.getTempFilename(dir, prefix)
-		if _, ok := fs.s.files[fullpath]; !ok {
-			break
+		if _, err := fs.Stat(fullpath); !os.IsNotExist(err) {
+			continue
 		}
 	}
 
@@ -140,6 +168,11 @@ func (fs *Memory) getTempFilename(dir, prefix string) string {
 
 // Rename moves a the `from` file to the `to` file.
 func (fs *Memory) Rename(from, to string) error {
+	fromDir, fromFile, err := fs.open(from, 0)
+	if err != nil {
+		return err
+	}
+
 	from = fs.Join(fs.base, from)
 	to = fs.Join(fs.base, to)
 
@@ -278,12 +311,18 @@ type fileInfo struct {
 	isDir bool
 }
 
-func newFileInfo(base, fullpath string, size int) *fileInfo {
-	filename, _ := filepath.Rel(base, fullpath)
-
+func newFileInfo(base string, size int) *fileInfo {
 	return &fileInfo{
-		name: filename,
+		name: base,
 		size: size,
+	}
+}
+
+func newDirInfo(base string, size int) *fileInfo {
+	return &fileInfo{
+		name:  base,
+		size:  size,
+		isDir: true,
 	}
 }
 
@@ -312,7 +351,19 @@ func (*fileInfo) Sys() interface{} {
 }
 
 type storage struct {
+	dirs  map[string]*storage
 	files map[string]*file
+}
+
+func newStorage() *storage {
+	return &storage{
+		dirs:  make(map[string]*storage),
+		files: make(map[string]*file),
+	}
+}
+
+func (s *storage) Size() int64 {
+	return int64(len(s.dirs) + len(s.files))
 }
 
 type content struct {
